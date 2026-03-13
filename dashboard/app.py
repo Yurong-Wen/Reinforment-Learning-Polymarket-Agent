@@ -52,9 +52,35 @@ def load_config():
 
 @st.cache_resource(show_spinner="Loading PPO model …")
 def load_model(model_path: str):
+    p = Path(model_path)
+    candidates = []
+
+    # Primary target from config/sidebar.
+    candidates.append(p)
+    if p.suffix != ".zip":
+        candidates.append(p.with_suffix(".zip"))
+
+    # Fallbacks when training did not finish final save.
+    candidates.append(ROOT / "models" / "best" / "best_model.zip")
+    ckpts = sorted(
+        (ROOT / "models" / "checkpoints").glob("ppo_poly_*_steps.zip"),
+        key=lambda fp: fp.stat().st_mtime,
+        reverse=True,
+    )
+    if ckpts:
+        candidates.append(ckpts[0])
+
+    resolved = next((c for c in candidates if c.exists()), None)
+    if resolved is None:
+        st.warning(
+            "No PPO model file found. Tried configured path, "
+            "`models/best/best_model.zip`, and latest checkpoint."
+        )
+        return None
+
     try:
         from stable_baselines3 import PPO
-        return PPO.load(model_path)
+        return PPO.load(str(resolved))
     except Exception as exc:
         st.warning(f"Could not load model: {exc}")
         return None
@@ -76,6 +102,25 @@ def load_summary(_path: str):
 
 def metric_delta_color(val: float) -> str:
     return "normal" if val >= 0 else "inverse"
+
+
+def add_question_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a human-readable question label column with deduplication.
+
+    If multiple markets share the same question text, append " (2)", " (3)", ...
+    so select boxes remain unambiguous without exposing market IDs.
+    """
+    out = df.copy()
+    seen = {}
+    labels = []
+    for raw in out["question"].fillna("Untitled market").astype(str):
+        base = raw.strip() or "Untitled market"
+        idx = seen.get(base, 0) + 1
+        seen[base] = idx
+        labels.append(base if idx == 1 else f"{base} ({idx})")
+    out["display_question"] = labels
+    return out
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -183,9 +228,21 @@ with tab_live:
     else:
         from data.preprocessing import FEATURE_COLS
 
-        # Market selector
-        market_ids = sorted(df_proc["market_id"].unique())
-        sel_market = st.selectbox("Select market", market_ids)
+        # Market selector (question-first display, id used internally)
+        market_meta = (
+            df_proc.groupby("market_id", as_index=False)
+            .agg(question=("question", "first"), n_candles=("t", "count"))
+            .sort_values("question")
+            .reset_index(drop=True)
+        )
+        market_meta = add_question_labels(market_meta)
+        sel_label = st.selectbox(
+            "Select market question",
+            market_meta["display_question"].tolist(),
+        )
+        sel_market = market_meta.loc[
+            market_meta["display_question"] == sel_label, "market_id"
+        ].iloc[0]
         mkt_df = df_proc[df_proc["market_id"] == sel_market].sort_values("t").reset_index(drop=True)
         outcome = int(mkt_df["outcome"].iloc[0])
 
@@ -395,39 +452,53 @@ with tab_browser:
         filtered = markets_meta[
             markets_meta["split"].isin(split_filter) &
             markets_meta["outcome_label"].isin(outcome_filter)
-        ]
+        ].reset_index(drop=True)
 
-        st.dataframe(
-            filtered[["market_id", "question", "outcome_label", "n_candles", "split"]].rename(
-                columns={"market_id": "Market ID", "question": "Question",
-                         "outcome_label": "Outcome", "n_candles": "# Candles", "split": "Split"}
-            ),
-            use_container_width=True,
-        )
-
-        # Price chart for selected market
-        sel = st.selectbox("Inspect market price history", filtered["market_id"].tolist())
-        mkt_df = df_proc[df_proc["market_id"] == sel].sort_values("t")
-        if not mkt_df.empty and "c" in mkt_df.columns:
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=mkt_df["t"], y=mkt_df["c"],
-                mode="lines", name="YES price",
-                line=dict(color="#2563eb", width=1.5),
-            ))
-            if "volume" in mkt_df.columns:
-                fig.add_trace(go.Bar(
-                    x=mkt_df["t"], y=mkt_df["volume"],
-                    name="Volume", yaxis="y2",
-                    marker_color="rgba(37,99,235,0.2)",
-                ))
-                fig.update_layout(
-                    yaxis2=dict(overlaying="y", side="right", title="Volume"),
-                )
-            outcome_val = int(mkt_df["outcome"].iloc[0])
-            fig.update_layout(
-                title=f"{mkt_df['question'].iloc[0][:80]}…  → {'YES' if outcome_val == 1 else 'NO'}",
-                xaxis_title="Time", yaxis_title="YES Price ($)",
-                height=350, margin=dict(l=40, r=60, t=50, b=40),
+        if filtered.empty:
+            st.info("No markets match the selected filters.")
+        else:
+            filtered = add_question_labels(filtered)
+            st.dataframe(
+                filtered[["display_question", "outcome_label", "n_candles", "split"]].rename(
+                    columns={
+                        "display_question": "Question",
+                        "outcome_label": "Outcome",
+                        "n_candles": "# Candles",
+                        "split": "Split",
+                    }
+                ),
+                use_container_width=True,
             )
-            st.plotly_chart(fig, use_container_width=True)
+
+            # Price chart for selected market (question-first display)
+            sel_label = st.selectbox(
+                "Inspect market price history",
+                filtered["display_question"].tolist(),
+            )
+            sel_market = filtered.loc[
+                filtered["display_question"] == sel_label, "market_id"
+            ].iloc[0]
+            mkt_df = df_proc[df_proc["market_id"] == sel_market].sort_values("t")
+            if not mkt_df.empty and "c" in mkt_df.columns:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=mkt_df["t"], y=mkt_df["c"],
+                    mode="lines", name="YES price",
+                    line=dict(color="#2563eb", width=1.5),
+                ))
+                if "volume" in mkt_df.columns:
+                    fig.add_trace(go.Bar(
+                        x=mkt_df["t"], y=mkt_df["volume"],
+                        name="Volume", yaxis="y2",
+                        marker_color="rgba(37,99,235,0.2)",
+                    ))
+                    fig.update_layout(
+                        yaxis2=dict(overlaying="y", side="right", title="Volume"),
+                    )
+                outcome_val = int(mkt_df["outcome"].iloc[0])
+                fig.update_layout(
+                    title=f"{mkt_df['question'].iloc[0][:80]}…  → {'YES' if outcome_val == 1 else 'NO'}",
+                    xaxis_title="Time", yaxis_title="YES Price ($)",
+                    height=350, margin=dict(l=40, r=60, t=50, b=40),
+                )
+                st.plotly_chart(fig, use_container_width=True)

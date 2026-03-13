@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import os
+import sys
 import logging
 import pickle
 from pathlib import Path
@@ -37,6 +38,11 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
 )
 from stable_baselines3.common.vec_env import SubprocVecEnv
+
+# Allow running as: python training/train.py
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from data.preprocessing import build_dataset
 from env.polymarket_env import MultiMarketEnv

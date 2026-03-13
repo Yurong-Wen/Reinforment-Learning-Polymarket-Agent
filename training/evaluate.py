@@ -18,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import os
+import sys
 import logging
 import pickle
 from pathlib import Path
@@ -33,6 +34,11 @@ from rich.console import Console
 from rich.table import Table
 from rich.logging import RichHandler
 from stable_baselines3 import PPO
+
+# Allow running as: python training/evaluate.py
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from data.preprocessing import build_dataset, FEATURE_COLS
 from env.polymarket_env import MultiMarketEnv
