@@ -1,0 +1,53 @@
+# =============================================================================
+#  Polymarket RL — Master Configuration
+# =============================================================================
+
+# ── Data Collection ───────────────────────────────────────────────────────────
+data:
+  n_markets: 100                 # Number of resolved markets to collect
+  train_ratio: 0.80              # 80 % train / 20 % test split
+  price_interval: "1h"           # Candle interval for price history
+  raw_path:       "data/raw/polymarket_raw.parquet"
+  processed_path: "data/processed/features.parquet"
+  sentiment_path: "data/sentiment/sentiment_scores.parquet"
+  temporal_weights:
+    recent: 0.80                 # 80 % weight on recent 50 % of timesteps
+    old:    0.20                 # 20 % weight on older  50 % of timesteps
+
+# ── API Keys (override via .env file) ─────────────────────────────────────────
+api:
+  newsapi_key: ""                # Set NEWSAPI_KEY in .env
+
+# ── Environment ───────────────────────────────────────────────────────────────
+environment:
+  initial_cash:       1000.0    # Starting portfolio in USD
+  max_position_pct:   0.30      # Max 30 % of portfolio per bet
+  transaction_cost:   0.002     # 0.2 % per trade (Polymarket fee)
+  risk_penalty:       0.01      # Concentration penalty coefficient
+  window_size:        24        # Look-back window fed into LSTM (future use)
+
+# ── PPO Hyperparameters ───────────────────────────────────────────────────────
+ppo:
+  total_timesteps: 1_000_000
+  n_envs:          4            # Parallel environments
+  learning_rate:   3.0e-4
+  n_steps:         2048
+  batch_size:      64
+  n_epochs:        10
+  gamma:           0.99
+  gae_lambda:      0.95
+  clip_range:      0.20
+  ent_coef:        0.01         # Entropy bonus → encourages exploration
+  vf_coef:         0.50
+  max_grad_norm:   0.50
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+evaluation:
+  n_episodes:      50
+  target_roi_pct:  15.0         # Project goal: beat baseline by 10–20 %
+  model_path:      "models/ppo_polymarket_final"
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+dashboard:
+  port:            8501
+  refresh_secs:    5

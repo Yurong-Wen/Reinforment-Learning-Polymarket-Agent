@@ -1,0 +1,5 @@
+# Rename this file to .env and fill in your actual keys
+# cp env_example.txt .env
+
+# NewsAPI key for sentiment scoring (https://newsapi.org/ — free tier works)
+NEWSAPI_KEY=your_newsapi_key_here
