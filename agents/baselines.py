@@ -90,15 +90,16 @@ class MarketOddsAgent(BaseAgent):
     def act(self, obs: np.ndarray) -> int:
         if self._bought:
             return HOLD
-        # obs[YES_PROB_IDX] is the (scaled) yes_prob feature;
-        # we need to recover the raw value.  Since we don't have the scaler
-        # here, we use a sign-based heuristic: positive → market leans YES.
-        # For a cleaner approach pass the raw yes_price separately via info.
-        raw_signal = obs[YES_PROB_IDX]
-        if raw_signal > 0.0:     # scaled value above mean → YES favoured
+        # The observation contains the StandardScaler-transformed yes_prob feature
+        # at index YES_PROB_IDX.  Because the scaler is not available here, we use
+        # the sign of the scaled value as a heuristic: a positive value means the
+        # raw yes_prob was above the training mean, indicating the market leans YES.
+        # A cleaner alternative would be to pass the raw yes_price via the info dict.
+        scaled_yes_probability_signal = obs[YES_PROB_IDX]
+        if scaled_yes_probability_signal > 0.0:     # Market consensus favours YES outcome.
             self._bought = True
             return BUY_YES
-        elif raw_signal < 0.0:   # scaled value below mean → NO favoured
+        elif scaled_yes_probability_signal < 0.0:   # Market consensus favours NO outcome.
             self._bought = True
             return BUY_NO
         return HOLD
@@ -140,8 +141,11 @@ def run_baseline(
     rng      = np.random.default_rng(seed)
     returns, sharpes, drawdowns = [], [], []
 
-    for ep in range(n_episodes):
+    for episode_index in range(n_episodes):
         obs, _ = env.reset(seed=int(rng.integers(1_000_000)))
+        # agent.reset() must be called at the start of each episode so that
+        # stateful agents (e.g. AlwaysBuyYes) clear their internal flags and
+        # behave correctly from the first step of the new episode.
         agent.reset()
         done = False
 

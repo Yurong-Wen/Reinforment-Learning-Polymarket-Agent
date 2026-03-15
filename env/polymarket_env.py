@@ -89,11 +89,11 @@ class PolymarketEnv(gym.Env):
         self.T            = len(self.data)
         self.n_features   = self.data.shape[1]
 
-        self.initial_cash     = float(initial_cash)
-        self.max_pos_pct      = float(max_position_pct)
-        self.tc               = float(transaction_cost)
-        self.risk_penalty     = float(risk_penalty)
-        self.render_mode      = render_mode
+        self.initial_cash           = float(initial_cash)
+        self.max_pos_pct            = float(max_position_pct)
+        self.transaction_cost_rate  = float(transaction_cost)
+        self.risk_penalty           = float(risk_penalty)
+        self.render_mode            = render_mode
 
         # Observation = market features + 4 portfolio features
         # [yes_pos_ratio, no_pos_ratio, cash_ratio, time_remaining]
@@ -121,27 +121,32 @@ class PolymarketEnv(gym.Env):
 
     def _yes_price(self) -> float:
         """Current implied YES price (probability), clipped to (0.01, 0.99)."""
+        # Clip to a small epsilon away from 0 and 1 to prevent division-by-zero
+        # errors in the Kelly criterion and log-return calculations.
         raw = float(self.data[self.t, YES_PROB_IDX])
         return float(np.clip(raw, 0.01, 0.99))
 
     def _portfolio_value(self, yes_price: Optional[float] = None) -> float:
         """Total mark-to-market portfolio value."""
-        yp = yes_price if yes_price is not None else self._yes_price()
-        np_ = 1.0 - yp
-        return self.cash + self.yes_shares * yp + self.no_shares * np_
+        yes_price = yes_price if yes_price is not None else self._yes_price()
+        no_price = 1.0 - yes_price
+        return self.cash + self.yes_shares * yes_price + self.no_shares * no_price
 
     def _get_obs(self) -> np.ndarray:
-        """Concatenate market features with portfolio state."""
-        yp  = self._yes_price()
-        np_ = 1.0 - yp
-        pv  = self._portfolio_value(yp)
+        """Concatenate market features with portfolio state to form the full observation vector."""
+        yes_price = self._yes_price()
+        no_price  = 1.0 - yes_price
+        portfolio_value = self._portfolio_value(yes_price)
 
+        # The four portfolio features capture the agent's current financial state in
+        # normalised form so the PPO policy can compare positions across markets of
+        # different sizes without scale sensitivity.
         portfolio_feats = np.array(
             [
-                self.yes_shares * yp  / (pv + 1e-8),   # YES position ratio
-                self.no_shares  * np_ / (pv + 1e-8),   # NO  position ratio
-                self.cash             / (pv + 1e-8),   # cash ratio
-                1.0 - self.t / (self.T - 1 + 1e-8),    # time remaining [0,1]
+                self.yes_shares * yes_price / (portfolio_value + 1e-8),  # Fraction of portfolio held as YES shares.
+                self.no_shares  * no_price  / (portfolio_value + 1e-8),  # Fraction of portfolio held as NO shares.
+                self.cash                   / (portfolio_value + 1e-8),  # Fraction of portfolio held as cash.
+                1.0 - self.t / (self.T - 1 + 1e-8),                      # Time remaining in episode, decaying from 1 to 0.
             ],
             dtype=np.float32,
         )
@@ -176,32 +181,40 @@ class PolymarketEnv(gym.Env):
         """
         assert self.action_space.contains(action), f"Invalid action: {action}"
 
-        yp  = self._yes_price()
-        np_ = 1.0 - yp
-        pv_before = self._portfolio_value(yp)
-        bet_size  = self.max_pos_pct * pv_before
+        yes_price = self._yes_price()
+        no_price  = 1.0 - yes_price
+        portfolio_value_before_trade = self._portfolio_value(yes_price)
+        # The bet size is a fixed fraction of the current portfolio so the agent
+        # naturally scales down its trades as the portfolio shrinks.
+        bet_size = self.max_pos_pct * portfolio_value_before_trade
 
         # ── Execute trade ─────────────────────────────────────────────────
+        # Allow the trade only when the agent has enough cash (with a 1 %
+        # tolerance for floating-point rounding).
         if action == BUY_YES and self.cash >= bet_size * 0.99:
-            shares          = (bet_size * (1.0 - self.tc)) / yp
+            # Deduct transaction cost from the proceeds before converting to shares.
+            shares          = (bet_size * (1.0 - self.transaction_cost_rate)) / yes_price
             self.yes_shares += shares
             self.cash       -= bet_size
 
         elif action == SELL_YES and self.yes_shares > 1e-9:
-            proceeds         = self.yes_shares * yp * (1.0 - self.tc)
+            # Liquidate the full YES position and deduct transaction cost from proceeds.
+            proceeds         = self.yes_shares * yes_price * (1.0 - self.transaction_cost_rate)
             self.cash       += proceeds
             self.yes_shares  = 0.0
 
         elif action == BUY_NO and self.cash >= bet_size * 0.99:
-            shares          = (bet_size * (1.0 - self.tc)) / np_
+            # Buy NO shares using the complementary price (1 - yes_price).
+            shares          = (bet_size * (1.0 - self.transaction_cost_rate)) / no_price
             self.no_shares += shares
             self.cash      -= bet_size
 
         elif action == SELL_NO and self.no_shares > 1e-9:
-            proceeds        = self.no_shares * np_ * (1.0 - self.tc)
+            # Liquidate the full NO position and deduct transaction cost from proceeds.
+            proceeds        = self.no_shares * no_price * (1.0 - self.transaction_cost_rate)
             self.cash      += proceeds
             self.no_shares  = 0.0
-        # HOLD: no change
+        # HOLD: no change to positions or cash.
 
         # ── Advance time ──────────────────────────────────────────────────
         self.t += 1
@@ -209,41 +222,43 @@ class PolymarketEnv(gym.Env):
 
         # ── Final resolution payoff ───────────────────────────────────────
         if terminated:
-            # YES shares pay $1 each if YES won, else $0
+            # At market resolution, YES shares pay $1 each if YES won, otherwise $0.
             yes_payoff = self.yes_shares * (1.0 if self.outcome == 1 else 0.0)
-            # NO  shares pay $1 each if NO  won, else $0
+            # At market resolution, NO shares pay $1 each if NO won, otherwise $0.
             no_payoff  = self.no_shares  * (1.0 if self.outcome == 0 else 0.0)
             self.cash       += yes_payoff + no_payoff
             self.yes_shares  = 0.0
             self.no_shares   = 0.0
 
         # ── Compute reward ────────────────────────────────────────────────
-        yp_new  = self._yes_price() if not terminated else yp
-        np_new_ = 1.0 - yp_new
-        pv_after = self._portfolio_value(yp_new if not terminated else 1.0)
+        updated_yes_price = self._yes_price() if not terminated else yes_price
+        updated_no_price  = 1.0 - updated_yes_price
+        portfolio_value_after_trade = self._portfolio_value(updated_yes_price if not terminated else 1.0)
 
-        # Step P&L (log return for numerical stability)
-        pnl = (pv_after - pv_before) / (pv_before + 1e-8)
+        # Use a simple percentage return (not log-return) for the step P&L signal,
+        # normalised by the prior portfolio value for scale invariance.
+        step_profit_and_loss = (portfolio_value_after_trade - portfolio_value_before_trade) / (portfolio_value_before_trade + 1e-8)
 
-        # Concentration penalty encourages diversification
+        # The concentration penalty discourages the agent from placing all capital
+        # on one side of the market, encouraging more balanced position management.
         concentration = (
-            abs(self.yes_shares * yp_new)  +
-            abs(self.no_shares  * np_new_)
-        ) / (pv_after + 1e-8)
+            abs(self.yes_shares * updated_yes_price) +
+            abs(self.no_shares  * updated_no_price)
+        ) / (portfolio_value_after_trade + 1e-8)
 
-        reward = float(pnl - self.risk_penalty * concentration)
+        reward = float(step_profit_and_loss - self.risk_penalty * concentration)
 
         # ── Book-keeping ──────────────────────────────────────────────────
-        self.portfolio_history.append(pv_after)
+        self.portfolio_history.append(portfolio_value_after_trade)
         self.action_history.append(action)
         self.reward_history.append(reward)
 
         obs  = self._get_obs()
         info = {
-            "portfolio_value": pv_after,
-            "pnl":             pnl,
+            "portfolio_value": portfolio_value_after_trade,
+            "pnl":             step_profit_and_loss,
             "action_label":    ACTION_LABELS[action],
-            "yes_price":       yp,
+            "yes_price":       yes_price,
             "yes_shares":      self.yes_shares,
             "no_shares":       self.no_shares,
             "cash":            self.cash,
@@ -284,14 +299,14 @@ class PolymarketEnv(gym.Env):
     def render(self):
         if self.render_mode != "human":
             return
-        pv = self._portfolio_value()
-        ret = (pv / self.initial_cash - 1.0) * 100.0
+        portfolio_value = self._portfolio_value()
+        episode_return_percentage = (portfolio_value / self.initial_cash - 1.0) * 100.0
         last_action = ACTION_LABELS.get(
             self.action_history[-1] if self.action_history else HOLD
         )
         print(
             f"[Step {self.t:>4d}/{self.T}] "
-            f"PV={pv:>8.2f}  ret={ret:>+6.2f}%  "
+            f"PV={portfolio_value:>8.2f}  ret={episode_return_percentage:>+6.2f}%  "
             f"YES={self.yes_shares:.3f}  NO={self.no_shares:.3f}  "
             f"Cash={self.cash:.2f}  Action={last_action}"
         )
@@ -338,16 +353,19 @@ class MultiMarketEnv(gym.Env):
         self._current_idx      = 0
 
     def reset(self, seed=None, options=None):
-        # Sample a random market each episode
+        # Sample a random market each episode so the agent learns to generalise
+        # across different market dynamics rather than memorising a single market.
         rng = np.random.default_rng(seed)
         self._current_idx = int(rng.integers(len(self.markets)))
         data, outcome = self.markets[self._current_idx]
 
+        # Recreate the inner environment with the newly selected market's data
+        # while preserving all hyperparameters from the previous environment.
         self._env = PolymarketEnv(
             data, outcome,
             self._env.initial_cash,
             self._env.max_pos_pct,
-            self._env.tc,
+            self._env.transaction_cost_rate,
             self._env.risk_penalty,
             self._env.render_mode,
         )

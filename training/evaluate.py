@@ -100,9 +100,9 @@ def evaluate_ppo(
     rng = np.random.default_rng(seed)
     returns, sharpes, drawdowns = [], [], []
     all_actions   = []
-    sample_history = None   # save ONE portfolio history for plotting
+    sample_history = None   # Save ONE portfolio history from the first episode for plotting.
 
-    for ep in range(n_episodes):
+    for episode_index in range(n_episodes):
         obs, _ = env.reset(seed=int(rng.integers(1_000_000)))
         done   = False
         while not done:
@@ -114,6 +114,8 @@ def evaluate_ppo(
         returns.append(env.total_return())
         sharpes.append(env.sharpe_ratio())
         drawdowns.append(env.max_drawdown())
+        # Capture the portfolio trajectory from the first episode only to avoid
+        # storing 50 full histories in memory.
         if sample_history is None:
             sample_history = list(env.portfolio_history())
 
@@ -172,18 +174,24 @@ def plot_drawdowns(results: list[dict]):
     """Drawdown profile for each agent's sample episode."""
     fig, ax = plt.subplots(figsize=(12, 4))
 
-    for r in results:
-        hist = r.get("sample_history")
+    # Initialise drawdown_percentages to a safe default so the fill_between call
+    # below never raises a NameError if every agent has no sample_history.
+    drawdown_percentages = np.array([0.0])
+
+    for agent_result in results:
+        hist = agent_result.get("sample_history")
         if hist is None:
             continue
         arr  = np.array(hist)
         peak = np.maximum.accumulate(arr)
-        dd   = (arr - peak) / (peak + 1e-8) * 100
-        color = PALETTE.get(r["agent"], "#333333")
-        ax.plot(dd, label=r["agent"], color=color, linewidth=1.5)
+        # Compute percentage drawdown from the running peak at each timestep.
+        drawdown_percentages = (arr - peak) / (peak + 1e-8) * 100
+        color = PALETTE.get(agent_result["agent"], "#333333")
+        ax.plot(drawdown_percentages, label=agent_result["agent"], color=color, linewidth=1.5)
 
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.fill_between(range(len(dd)), dd, 0,
+    # Shade the area under the last agent's drawdown curve to highlight exposure.
+    ax.fill_between(range(len(drawdown_percentages)), drawdown_percentages, 0,
                     color=PALETTE["PPO"], alpha=0.10, label="_nolegend_")
     ax.set_xlabel("Timestep")
     ax.set_ylabel("Drawdown (%)")
@@ -200,9 +208,9 @@ def plot_return_distributions(results: list[dict]):
     """Box-plot of episode returns per agent."""
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    labels = [r["agent"]   for r in results]
-    data   = [r["returns"] for r in results]
-    colors = [PALETTE.get(r["agent"], "#333333") for r in results]
+    labels = [agent_result["agent"]   for agent_result in results]
+    data   = [agent_result["returns"] for agent_result in results]
+    colors = [PALETTE.get(agent_result["agent"], "#333333") for agent_result in results]
 
     bp = ax.boxplot(data, patch_artist=True, notch=False, vert=True)
     for patch, color in zip(bp["boxes"], colors):
@@ -252,25 +260,26 @@ def print_summary_table(results: list[dict]):
     table.add_column("Mean Sharpe",  justify="right")
     table.add_column("Mean MaxDD (%)", justify="right")
 
-    # Sort by mean return descending
-    for r in sorted(results, key=lambda x: x["mean_return"], reverse=True):
-        roi_str = f"{r['mean_return']:>+.2f}"
-        sharpe  = f"{r['mean_sharpe']:>.3f}"
-        dd      = f"{r['mean_dd']:>+.2f}"
-        style   = "green" if r["agent"] == "PPO" else "white"
-        table.add_row(r["agent"], roi_str, sharpe, dd, style=style)
+    # Sort results by mean return in descending order so the best-performing
+    # agent always appears at the top of the printed table.
+    for agent_result in sorted(results, key=lambda x: x["mean_return"], reverse=True):
+        roi_str = f"{agent_result['mean_return']:>+.2f}"
+        sharpe  = f"{agent_result['mean_sharpe']:>.3f}"
+        dd      = f"{agent_result['mean_dd']:>+.2f}"
+        style   = "green" if agent_result["agent"] == "PPO" else "white"
+        table.add_row(agent_result["agent"], roi_str, sharpe, dd, style=style)
 
     console.print(table)
 
-    # Save as CSV
+    # Save as CSV so the Streamlit dashboard can load the results without re-running.
     df = pd.DataFrame([
         {
-            "agent":       r["agent"],
-            "mean_roi":    r["mean_return"],
-            "mean_sharpe": r["mean_sharpe"],
-            "mean_maxdd":  r["mean_dd"],
+            "agent":       agent_result["agent"],
+            "mean_roi":    agent_result["mean_return"],
+            "mean_sharpe": agent_result["mean_sharpe"],
+            "mean_maxdd":  agent_result["mean_dd"],
         }
-        for r in results
+        for agent_result in results
     ])
     df.to_csv(RESULTS_DIR / "summary.csv", index=False)
     log.info("Saved results/summary.csv")
@@ -343,9 +352,11 @@ def evaluate(config_path: str = "configs/config.yaml"):
 
     for agent in baseline_agents:
         env = _make_env()
-        r   = run_baseline(agent, env, n_episodes=n_ep)
+        agent_result = run_baseline(agent, env, n_episodes=n_ep)
 
-        # Collect a sample history for plotting
+        # Run one additional deterministic episode to capture a sample portfolio
+        # history for the comparison plots.  This episode is separate from the
+        # n_episodes used for metric aggregation.
         obs, _ = env.reset(seed=0)
         agent.reset()
         done = False
@@ -353,9 +364,9 @@ def evaluate(config_path: str = "configs/config.yaml"):
             action = agent.act(obs)
             obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-        r["sample_history"] = list(env.portfolio_history())
+        agent_result["sample_history"] = list(env.portfolio_history())
 
-        results.append(r)
+        results.append(agent_result)
         env.close()
 
     # ── 4. Print summary ──────────────────────────────────────────────────

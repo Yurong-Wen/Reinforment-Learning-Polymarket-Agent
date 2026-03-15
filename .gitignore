@@ -1,0 +1,18 @@
+# Claude Code internal files — never commit to the repository
+.claude/
+
+# Python virtual environments (note: env/ is excluded because it's a project module)
+.venv/
+venv/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Common OS/IDE files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
