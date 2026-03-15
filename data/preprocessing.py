@@ -76,11 +76,15 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     df["spread_proxy"] = (df["h"] - df["l"]) / (df["c"].clip(lower=1e-8))
 
     # ── Implied probability (clipped to avoid log issues) ───────────────
+    # Clip close prices to [0.02, 0.98] to prevent log(0) errors in the Kelly
+    # criterion and to avoid numerical instability near the market boundaries.
     df["yes_prob"] = df["c"].clip(0.02, 0.98)
     df["no_prob"]  = 1.0 - df["yes_prob"]
 
     # ── Kelly criterion signals ─────────────────────────────────────────
-    #   Expected value: p_win * 1 - p_lose * 1   (binary payoff)
+    # The simplified Kelly fraction for a binary bet with equal payoffs is
+    # p_win - p_lose, which equals 2*p - 1.  A positive value means the
+    # market-implied edge favours buying that side.
     df["kelly_yes"] = df["yes_prob"] - df["no_prob"]
     df["kelly_no"]  = df["no_prob"]  - df["yes_prob"]
 
@@ -126,11 +130,13 @@ def compute_temporal_weights(
     split   = n // 2
 
     if split > 0:
-        weights[:split] = old_weight    / split           # older  half
+        weights[:split] = old_weight    / split           # Each older row receives an equal share of the old_weight budget.
     if n - split > 0:
-        weights[split:] = recent_weight / (n - split)     # recent half
+        weights[split:] = recent_weight / (n - split)     # Each recent row receives an equal share of the recent_weight budget.
 
-    weights /= weights.sum()                              # normalise to sum = 1
+    # Normalise so that the weights sum to exactly 1.0, making them valid
+    # sample probabilities for use with sklearn's sample_weight parameter.
+    weights /= weights.sum()
     return weights.astype(np.float32)
 
 
@@ -158,28 +164,33 @@ def build_dataset(
     """
     os.makedirs(os.path.dirname(processed_path), exist_ok=True)
 
-    # 1. Load raw data
+    # Step 1: Load the raw OHLCV parquet produced by fetch_polymarket.py.
     log.info(f"Loading raw data from {raw_parquet} …")
     df = pd.read_parquet(raw_parquet)
     log.info(f"  Raw shape: {df.shape}")
 
-    # 2. Drop markets with unknown outcome
+    # Step 2: Remove markets whose outcome is unknown (-1) because they cannot
+    # be used as supervised labels in the environment's resolution payoff.
     df = df[df["outcome"].isin([0, 1])].copy()
     log.info(f"  After dropping unknown outcomes: {df.shape}")
 
-    # 3. Technical features
+    # Step 3: Compute per-market rolling technical features (momentum, volatility, spread).
     log.info("Computing technical features …")
     df = add_technical_features(df)
 
-    # 4. Merge sentiment
+    # Step 4: Left-join FinBERT sentiment scores by market_id; rows without a
+    # sentiment match receive a neutral score of 0.0 to avoid imputation bias.
     log.info("Merging sentiment scores …")
     df = merge_sentiment(df, sentiment_path)
 
-    # 5. Drop NaN rows (from rolling windows)
+    # Step 5: Drop rows that still contain NaN after rolling windows are applied.
+    # This typically removes the first few candles of each market.
     df = df.dropna(subset=FEATURE_COLS).reset_index(drop=True)
     log.info(f"  After dropna: {df.shape}")
 
-    # 6. Train / test split BY MARKET (no data leakage)
+    # Step 6: Split by market (not by row) to prevent temporal data leakage.
+    # Using a row-level split would allow the model to learn from future market
+    # data that belongs to the same market as a test observation.
     all_markets = df["market_id"].unique()
     np.random.seed(42)
     np.random.shuffle(all_markets)
@@ -194,24 +205,27 @@ def build_dataset(
         f"Test:  {len(test_markets)}  markets / {len(df_test):,}  rows"
     )
 
-    # 7. Feature matrices
+    # Step 7: Extract the raw feature matrices before scaling.
     X_train_raw = df_train[FEATURE_COLS].values.astype(np.float32)
     X_test_raw  = df_test [FEATURE_COLS].values.astype(np.float32)
 
-    # 8. Z-score scaling (fit on train only)
+    # Step 8: Fit the StandardScaler on the training set only and apply it to
+    # both splits.  Fitting on the test set would cause data leakage.
     scaler  = StandardScaler()
     X_train = scaler.fit_transform(X_train_raw).astype(np.float32)
     X_test  = scaler.transform(X_test_raw).astype(np.float32)
 
-    # 9. Per-row temporal weights (80 / 20)
+    # Step 9: Assign per-row temporal weights following the project's 80/20 policy
+    # (80 % weight on the more recent half of each split's timesteps).
     w_train = compute_temporal_weights(len(X_train), recent_weight, old_weight)
     w_test  = compute_temporal_weights(len(X_test),  recent_weight, old_weight)
 
-    # 10. Labels (binary outcome per market row)
+    # Step 10: Extract the binary resolution outcome label for every row.
     y_train = df_train["outcome"].values.astype(np.int8)
     y_test  = df_test ["outcome"].values.astype(np.int8)
 
-    # 11. Save processed DataFrame for EDA / notebooks
+    # Step 11: Annotate and save the full processed DataFrame for dashboard
+    # exploration and Jupyter notebook analysis.
     df_train["split"] = "train"
     df_test ["split"] = "test"
     df_processed = pd.concat([df_train, df_test], ignore_index=True)

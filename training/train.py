@@ -73,16 +73,18 @@ def make_market_list(
     List of (feature_matrix, outcome) tuples, one per market.
     """
     markets = []
-    for mid in market_ids:
-        mask    = df[df["market_id"] == mid].index
-        # align mask with X indices after dropna/reset_index
+    for current_market_id in market_ids:
+        mask    = df[df["market_id"] == current_market_id].index
+        # Align the DataFrame index labels with positional indices in X after dropna/reset_index.
         indices = df.index.get_indexer(mask)
-        # Filter out -1 (not found)
+        # Remove any -1 entries that indicate a label was not found in the index.
         indices = indices[indices >= 0]
+        # Skip markets with fewer than 5 candles because the environment needs a
+        # minimum sequence length to compute rolling features without crashing.
         if len(indices) < 5:
             continue
         market_X = X[indices]
-        outcome  = int(y[indices[0]])          # outcome is constant per market
+        outcome  = int(y[indices[0]])          # The outcome is constant for every row of a given market.
         markets.append((market_X, outcome))
     return markets
 
@@ -128,30 +130,22 @@ def train(config_path: str = "configs/config.yaml") -> PPO:
     # ── 2. Preprocess (cached) ────────────────────────────────────────────
     processed_path = data_cfg["processed_path"]
 
+    # Log whether we are reusing a previously cached parquet file or computing
+    # features from scratch.  Both cases call build_dataset() — the function
+    # itself handles the caching logic internally.
     if Path(processed_path).exists():
-        log.info(f"Processed features found at {processed_path} — loading …")
-        import pandas as pd
-        df_proc = pd.read_parquet(processed_path)
-        # Re-build splits from saved split column
-        from data.preprocessing import FEATURE_COLS, build_dataset
-        ds = build_dataset(
-            raw_parquet=data_cfg["raw_path"],
-            sentiment_path=data_cfg["sentiment_path"],
-            processed_path=processed_path,
-            train_ratio=data_cfg["train_ratio"],
-            recent_weight=data_cfg["temporal_weights"]["recent"],
-            old_weight=data_cfg["temporal_weights"]["old"],
-        )
+        log.info(f"Processed features found at {processed_path} — reusing cache …")
     else:
-        log.info("No processed features found — running preprocessing …")
-        ds = build_dataset(
-            raw_parquet=data_cfg["raw_path"],
-            sentiment_path=data_cfg["sentiment_path"],
-            processed_path=processed_path,
-            train_ratio=data_cfg["train_ratio"],
-            recent_weight=data_cfg["temporal_weights"]["recent"],
-            old_weight=data_cfg["temporal_weights"]["old"],
-        )
+        log.info("No processed features found — running full preprocessing pipeline …")
+
+    ds = build_dataset(
+        raw_parquet=data_cfg["raw_path"],
+        sentiment_path=data_cfg["sentiment_path"],
+        processed_path=processed_path,
+        train_ratio=data_cfg["train_ratio"],
+        recent_weight=data_cfg["temporal_weights"]["recent"],
+        old_weight=data_cfg["temporal_weights"]["old"],
+    )
 
     X_train = ds["X_train"];  y_train = ds["y_train"]
     X_test  = ds["X_test"];   y_test  = ds["y_test"]
@@ -168,15 +162,19 @@ def train(config_path: str = "configs/config.yaml") -> PPO:
     console.print(
         f"\n[bold]Markets[/]  train={len(train_markets)}  test={len(test_markets)}\n"
     )
+    # A missing training set means the data collection step was never run or
+    # all markets were too short and were filtered out.
     if not train_markets:
         raise RuntimeError("No training markets available. Run data collection first.")
 
     # ── 4. Vectorised training environments ───────────────────────────────
-    n_envs = min(ppo_cfg["n_envs"], len(train_markets))
+    # Cap the number of parallel workers at the number of available markets so
+    # that each worker is guaranteed at least one market to sample from.
+    number_of_parallel_environments = min(ppo_cfg["n_envs"], len(train_markets))
     vec_env = make_vec_env(
         make_env_fn(train_markets, env_cfg),
-        n_envs=n_envs,
-        vec_env_cls=SubprocVecEnv if n_envs > 1 else None,
+        n_envs=number_of_parallel_environments,
+        vec_env_cls=SubprocVecEnv if number_of_parallel_environments > 1 else None,
     )
 
     # ── 5. Evaluation environment ─────────────────────────────────────────
@@ -214,6 +212,8 @@ def train(config_path: str = "configs/config.yaml") -> PPO:
     os.makedirs("models/checkpoints",  exist_ok=True)
 
     callbacks = CallbackList([
+        # EvalCallback runs the agent on the held-out evaluation environment at regular
+        # intervals and saves the model weights whenever a new best mean reward is achieved.
         EvalCallback(
             eval_env,
             best_model_save_path="models/best/",
@@ -223,6 +223,8 @@ def train(config_path: str = "configs/config.yaml") -> PPO:
             deterministic=True,
             render=False,
         ),
+        # CheckpointCallback saves a periodic snapshot regardless of reward, providing
+        # recovery points if training is interrupted before the best model is saved.
         CheckpointCallback(
             save_freq=50_000,
             save_path="models/checkpoints/",
@@ -234,7 +236,7 @@ def train(config_path: str = "configs/config.yaml") -> PPO:
     console.print(
         f"\n[bold green]Starting PPO training[/]  "
         f"total_timesteps={ppo_cfg['total_timesteps']:,}  "
-        f"n_envs={n_envs}\n"
+        f"n_envs={number_of_parallel_environments}\n"
     )
     model.learn(
         total_timesteps=ppo_cfg["total_timesteps"],
